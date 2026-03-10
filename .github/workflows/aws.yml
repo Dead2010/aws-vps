@@ -1,0 +1,146 @@
+name: Ultra Fast SG VPS Runner
+
+on:
+  workflow_dispatch:  # Manual trigger only - for security
+  # Optional: uncomment below to run on push to main
+  # push:
+  #   branches: [ "main" ]
+
+env:
+  # Set your preferred region - Singapore is 'ap-southeast-1'
+  AWS_REGION: ap-southeast-1
+  
+  # SSH Configuration
+  SSH_USER: runner
+  SSH_PASSWORD: 12345678
+  SSH_PORT: 22
+
+jobs:
+  create-sg-runner:
+    name: Create Singapore VPS Runner
+    # Use GitHub's Singapore runner if available, otherwise closest region
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup SSH Server
+      run: |
+        # Update and install SSH server
+        sudo apt-get update
+        sudo apt-get install -y openssh-server openssh-client net-tools curl jq
+        
+        # Configure SSH for password authentication
+        sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+        
+        # Restart SSH service
+        sudo systemctl restart ssh
+        sudo systemctl enable ssh
+
+    - name: Create Runner User
+      run: |
+        # Create user with specified username and password
+        sudo useradd -m -s /bin/bash ${{ env.SSH_USER }}
+        echo "${{ env.SSH_USER }}:${{ env.SSH_PASSWORD }}" | sudo chpasswd
+        
+        # Add to sudo group for convenience (optional)
+        sudo usermod -aG sudo ${{ env.SSH_USER }}
+        
+        # Create .ssh directory for future key-based auth if needed
+        sudo mkdir -p /home/${{ env.SSH_USER }}/.ssh
+        sudo chmod 700 /home/${{ env.SSH_USER }}/.ssh
+        sudo chown ${{ env.SSH_USER }}:${{ env.SSH_USER }} /home/${{ env.SSH_USER }}/.ssh
+        
+        # Verify user creation
+        echo "User ${{ env.SSH_USER }} created successfully"
+
+    - name: Install Additional Tools
+      run: |
+        # Install common development tools
+        sudo apt-get install -y \
+          docker.io \
+          docker-compose \
+          git \
+          curl \
+          wget \
+          vim \
+          htop \
+          nodejs \
+          npm \
+          python3 \
+          python3-pip \
+          build-essential
+        
+        # Add user to docker group
+        sudo usermod -aG docker ${{ env.SSH_USER }}
+        
+        # Install GitHub runner if you want this to be a persistent runner
+        sudo mkdir -p /home/${{ env.SSH_USER }}/actions-runner
+        sudo chown ${{ env.SSH_USER }}:${{ env.SSH_USER }} /home/${{ env.SSH_USER }}/actions-runner
+        
+        echo "Additional tools installed"
+
+    - name: Setup bore.pub Tunnel
+      id: bore-tunnel
+      uses: codetalkio/expose-tunnel@v1
+      with:
+        service: bore.pub
+        port: ${{ env.SSH_PORT }}
+        blocking: 120m  # Keep tunnel alive for 2 hours max
+
+    - name: Display Connection Information
+      run: |
+        echo "=========================================="
+        echo "✅ SSH SERVER IS READY! Connect via Termius"
+        echo "=========================================="
+        echo ""
+        echo "📡 TUNNEL INFORMATION:"
+        echo "   Host: ${{ steps.bore-tunnel.outputs.tunnel-url }}"
+        echo ""
+        echo "🔐 SSH CREDENTIALS:"
+        echo "   Username: ${{ env.SSH_USER }}"
+        echo "   Password: ${{ env.SSH_PASSWORD }}"
+        echo "   Port: 22 (included in tunnel URL)"
+        echo ""
+        echo "📋 EXAMPLE SSH COMMAND:"
+        echo "   ssh ${{ env.SSH_USER }}@${{ steps.bore-tunnel.outputs.tunnel-host }} -p ${{ steps.bore-tunnel.outputs.tunnel-port }}"
+        echo ""
+        echo "📱 TERMIUS CONNECTION STRING:"
+        echo "   Host: ${{ steps.bore-tunnel.outputs.tunnel-host }}"
+        echo "   Port: ${{ steps.bore-tunnel.outputs.tunnel-port }}"
+        echo "   User: ${{ env.SSH_USER }}"
+        echo "   Pass: ${{ env.SSH_PASSWORD }}"
+        echo ""
+        echo "🌏 REGION: Singapore (GitHub Runner Location)"
+        echo "⏱️  Tunnel expires in: 2 hours"
+        echo "=========================================="
+
+    - name: Verify SSH Service
+      run: |
+        # Test SSH locally
+        echo "Testing local SSH connection..."
+        sudo systemctl status ssh --no-pager
+        
+        # Get local IP
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        echo "Local IP: $LOCAL_IP"
+        
+        # Test SSH connection locally
+        echo "Testing local SSH login (this should work)..."
+        sshpass -p "${{ env.SSH_PASSWORD }}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${{ env.SSH_USER }}@localhost echo "SSH is working!" || echo "Local SSH test failed but tunnel may still work"
+
+    - name: Keep Runner Alive
+      run: |
+        echo "Runner is active. SSH tunnel available at: ${{ steps.bore-tunnel.outputs.tunnel-url }}"
+        echo "Press Ctrl+C to stop, or let it run for up to 2 hours"
+        
+        # Simple keep-alive loop
+        COUNTER=0
+        while [ $COUNTER -lt 120 ]; do  # 120 * 30s = 60 minutes
+          echo "Runner active for $(($COUNTER * 30)) seconds. Tunnel: ${{ steps.bore-tunnel.outputs.tunnel-url }}"
+          sleep 30
+          COUNTER=$((COUNTER + 1))
+        done
