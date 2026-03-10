@@ -2,7 +2,6 @@ name: AWS SG VPS Runner with bore.pub Tunnel
 
 on:
   workflow_dispatch:  # Manual trigger only
-  # Optional: Uncomment to run on push
   # push:
   #   branches: [ "main" ]
 
@@ -13,9 +12,46 @@ env:
   SSH_PORT: 22
 
 jobs:
+  validate-credentials:
+    name: Validate AWS Credentials
+    runs-on: ubuntu-latest
+    outputs:
+      credentials_valid: ${{ steps.check-creds.outputs.valid }}
+    steps:
+    - name: Check if AWS secrets are configured
+      id: check-creds
+      run: |
+        if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+          echo "❌ AWS credentials not found in GitHub secrets!"
+          echo "Please add the following secrets to your repository:"
+          echo "  - AWS_ACCESS_KEY_ID"
+          echo "  - AWS_SECRET_ACCESS_KEY"
+          echo "valid=false" >> $GITHUB_OUTPUT
+          exit 1
+        else
+          echo "✅ AWS credentials found in secrets"
+          echo "valid=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Test AWS credentials
+      if: steps.check-creds.outputs.valid == 'true'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Verify AWS credentials work
+      if: steps.check-creds.outputs.valid == 'true'
+      run: |
+        aws sts get-caller-identity
+        echo "✅ AWS credentials are valid!"
+
   create-aws-vps:
     name: Create AWS EC2 Singapore VPS
+    needs: validate-credentials
     runs-on: ubuntu-latest
+    if: success()
     
     steps:
     - name: Checkout repository
@@ -31,22 +67,36 @@ jobs:
     - name: Create EC2 Security Group
       id: create-sg
       run: |
-        # Create security group allowing SSH
-        SG_ID=$(aws ec2 create-security-group \
-          --group-name github-runner-sg-$(date +%s) \
-          --description "Security group for GitHub runner SSH access" \
-          --query 'GroupId' \
-          --output text)
+        # Generate unique name
+        SG_NAME="github-runner-sg-$(date +%s)"
         
-        # Allow SSH from anywhere (for bore.pub tunnel)
-        aws ec2 authorize-security-group-ingress \
-          --group-id $SG_ID \
-          --protocol tcp \
-          --port 22 \
-          --cidr 0.0.0.0/0
+        # Check if security group already exists
+        EXISTING_SG=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=$SG_NAME" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
         
-        echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
-        echo "Security Group created: $SG_ID"
+        if [ "$EXISTING_SG" != "None" ] && [ "$EXISTING_SG" != "" ]; then
+          echo "Security group already exists: $EXISTING_SG"
+          echo "sg_id=$EXISTING_SG" >> $GITHUB_OUTPUT
+        else
+          # Create new security group
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name $SG_NAME \
+            --description "Security group for GitHub runner SSH access" \
+            --query 'GroupId' \
+            --output text)
+          
+          # Allow SSH from anywhere (for bore.pub tunnel)
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 22 \
+            --cidr 0.0.0.0/0
+          
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+          echo "✅ Security Group created: $SG_ID"
+        fi
 
     - name: Launch EC2 Instance (Singapore Region)
       id: launch-ec2
@@ -54,12 +104,16 @@ jobs:
         # Get latest Ubuntu 22.04 AMI for ap-southeast-1
         AMI_ID=$(aws ec2 describe-images \
           --owners 099720109477 \
-          --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
-          --query 'Images[0].ImageId' \
+          --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" "Name=state,Values=available" \
+          --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
           --output text)
         
-        # Create key pair for SSH access
+        echo "Using AMI: $AMI_ID"
+        
+        # Create unique key pair name
         KEY_NAME="github-runner-key-$(date +%s)"
+        
+        # Create key pair for SSH access
         aws ec2 create-key-pair \
           --key-name $KEY_NAME \
           --query 'KeyMaterial' \
@@ -72,10 +126,12 @@ jobs:
           --instance-type t3.medium \
           --key-name $KEY_NAME \
           --security-group-ids ${{ steps.create-sg.outputs.sg_id }} \
-          --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=30} \
+          --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=30,VolumeType=gp3} \
           --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=github-runner-sg}]' \
           --query 'Instances[0].InstanceId' \
           --output text)
+        
+        echo "✅ Instance launched: $INSTANCE_ID"
         
         # Wait for instance to be running
         echo "Waiting for instance to start..."
@@ -90,11 +146,11 @@ jobs:
         echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
         echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
         echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
-        echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
         
-        # Save key for later steps
-        echo "SSH_KEY<<EOF" >> $GITHUB_OUTPUT
-        cat ${KEY_NAME}.pem >> $GITHUB_OUTPUT
+        # Save key content
+        KEY_CONTENT=$(cat ${KEY_NAME}.pem)
+        echo "ssh_key<<EOF" >> $GITHUB_OUTPUT
+        echo "$KEY_CONTENT" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
 
     - name: Wait for SSH to be ready
@@ -102,19 +158,19 @@ jobs:
         echo "Waiting for SSH to be available on ${{ steps.launch-ec2.outputs.public_ip }}..."
         for i in {1..30}; do
           if nc -zv ${{ steps.launch-ec2.outputs.public_ip }} 22 2>/dev/null; then
-            echo "SSH is ready!"
+            echo "✅ SSH is ready!"
             break
           fi
           echo "Attempt $i: SSH not ready yet..."
           sleep 10
         done
 
-    - name: Setup EC2 Instance with SSH Server
+    - name: Setup EC2 Instance
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ steps.launch-ec2.outputs.public_ip }}
         username: ubuntu
-        key: ${{ steps.launch-ec2.outputs.SSH_KEY }}
+        key: ${{ steps.launch-ec2.outputs.ssh_key }}
         script: |
           # Update system
           sudo apt-get update
@@ -136,13 +192,25 @@ jobs:
             python3-pip \
             build-essential \
             net-tools \
-            jq
+            jq \
+            sshpass
           
-          # Create runner user with password
-          sudo useradd -m -s /bin/bash ${{ env.SSH_USER }} || echo "User already exists"
+          # Start Docker
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          
+          # Create runner user (check if exists first)
+          if id "${{ env.SSH_USER }}" &>/dev/null; then
+            echo "User ${{ env.SSH_USER }} already exists"
+          else
+            sudo useradd -m -s /bin/bash ${{ env.SSH_USER }}
+            echo "User ${{ env.SSH_USER }} created"
+          fi
+          
+          # Set password
           echo "${{ env.SSH_USER }}:${{ env.SSH_PASSWORD }}" | sudo chpasswd
           
-          # Add to docker and sudo groups
+          # Add to groups
           sudo usermod -aG docker ${{ env.SSH_USER }}
           sudo usermod -aG sudo ${{ env.SSH_USER }}
           
@@ -151,10 +219,10 @@ jobs:
           sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
           
-          # Restart SSH service
+          # Restart SSH
           sudo systemctl restart ssh
           
-          # Create .ssh directory for future use
+          # Create .ssh directory
           sudo mkdir -p /home/${{ env.SSH_USER }}/.ssh
           sudo chmod 700 /home/${{ env.SSH_USER }}/.ssh
           sudo chown ${{ env.SSH_USER }}:${{ env.SSH_USER }} /home/${{ env.SSH_USER }}/.ssh
@@ -162,18 +230,34 @@ jobs:
           # Verify setup
           echo "=== Setup Complete ==="
           echo "User: ${{ env.SSH_USER }}"
-          echo "Password: ${{ env.SSH_PASSWORD }}"
-          echo "Docker version: $(docker --version)"
-          echo "Node version: $(node --version)"
-          echo "NPM version: $(npm --version)"
+          echo "Password: [set]"
+          echo "Docker: $(docker --version)"
+          echo "Node: $(node --version)"
+          echo "Instance ready!"
 
-    - name: Setup bore.pub Tunnel
+    - name: Install bore-cli and Create Tunnel
       id: bore-tunnel
-      uses: codetalkio/expose-tunnel@v1
-      with:
-        service: bore.pub
-        port: ${{ env.SSH_PORT }}
-        blocking: 120m  # Keep tunnel alive for 2 hours
+      run: |
+        # Install bore-cli
+        npm install -g bore-cli
+        
+        # Start bore tunnel in background
+        bore local 22 --to bore.pub > bore_output.txt 2>&1 &
+        BORE_PID=$!
+        
+        # Wait for tunnel to establish
+        sleep 5
+        
+        # Extract tunnel info
+        TUNNEL_URL=$(grep -o 'bore.pub:[0-9]*' bore_output.txt | head -1)
+        TUNNEL_HOST="bore.pub"
+        TUNNEL_PORT=$(echo $TUNNEL_URL | cut -d':' -f2)
+        
+        echo "tunnel_host=$TUNNEL_HOST" >> $GITHUB_OUTPUT
+        echo "tunnel_port=$TUNNEL_PORT" >> $GITHUB_OUTPUT
+        echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+        
+        echo "✅ Tunnel created: $TUNNEL_URL"
 
     - name: Display Connection Information
       run: |
@@ -182,52 +266,41 @@ jobs:
         echo "=========================================="
         echo ""
         echo "📡 TUNNEL INFORMATION:"
-        echo "   Host: ${{ steps.bore-tunnel.outputs.tunnel-host }}"
-        echo "   Port: ${{ steps.bore-tunnel.outputs.tunnel-port }}"
-        echo "   URL: ${{ steps.bore-tunnel.outputs.tunnel-url }}"
+        echo "   Host: ${{ steps.bore-tunnel.outputs.tunnel_host }}"
+        echo "   Port: ${{ steps.bore-tunnel.outputs.tunnel_port }}"
+        echo "   URL: ${{ steps.bore-tunnel.outputs.tunnel_url }}"
         echo ""
         echo "🔐 SSH CREDENTIALS:"
         echo "   Username: ${{ env.SSH_USER }}"
         echo "   Password: ${{ env.SSH_PASSWORD }}"
-        echo "   Port: 22 (via tunnel)"
-        echo ""
-        echo "📋 EXAMPLE SSH COMMAND:"
-        echo "   ssh ${{ env.SSH_USER }}@${{ steps.bore-tunnel.outputs.tunnel-host }} -p ${{ steps.bore-tunnel.outputs.tunnel-port }}"
         echo ""
         echo "📱 TERMIUS CONNECTION:"
-        echo "   Host: ${{ steps.bore-tunnel.outputs.tunnel-host }}"
-        echo "   Port: ${{ steps.bore-tunnel.outputs.tunnel-port }}"
+        echo "   Host: ${{ steps.bore-tunnel.outputs.tunnel_host }}"
+        echo "   Port: ${{ steps.bore-tunnel.outputs.tunnel_port }}"
         echo "   User: ${{ env.SSH_USER }}"
         echo "   Pass: ${{ env.SSH_PASSWORD }}"
         echo ""
-        echo "🌏 AWS REGION: Singapore (ap-southeast-1)"
-        echo "💻 INSTANCE TYPE: t3.medium (2 vCPU, 4GB RAM)"
-        echo "💾 STORAGE: 30GB SSD"
-        echo "⏱️  Tunnel expires in: 2 hours"
-        echo "💰 COST: ~$0.0416/hour (t3.medium on-demand)"
+        echo "📋 SSH COMMAND:"
+        echo "   ssh ${{ env.SSH_USER }}@${{ steps.bore-tunnel.outputs.tunnel_host }} -p ${{ steps.bore-tunnel.outputs.tunnel_port }}"
         echo ""
-        echo "⚠️  IMPORTANT: This instance will continue running until terminated!"
-        echo "   To terminate, go to AWS Console → EC2 → Instances"
-        echo "   Instance ID: ${{ steps.launch-ec2.outputs.instance_id }}"
+        echo "🌏 AWS REGION: Singapore (ap-southeast-1)"
+        echo "💻 INSTANCE: t3.medium (2 vCPU, 4GB RAM)"
+        echo "💾 STORAGE: 30GB SSD"
+        echo "💰 COST: ~$0.0416/hour"
+        echo ""
+        echo "⚠️  Instance ID: ${{ steps.launch-ec2.outputs.instance_id }}"
         echo "=========================================="
 
-    - name: Keep Runner Alive with Auto-Termination Notice
+    - name: Keep Tunnel Alive
       run: |
-        echo "AWS EC2 instance is running. SSH tunnel available for 2 hours."
-        echo "Instance ID: ${{ steps.launch-ec2.outputs.instance_id }}"
-        echo ""
-        echo "To terminate instance automatically after 2 hours, uncomment the cleanup job below."
-        echo "Press Ctrl+C to stop this job (instance will keep running!)."
+        echo "Tunnel is active. Will stay alive for 2 hours."
+        echo "Press Ctrl+C to stop (instance will keep running!)"
         
-        # Simple keep-alive with countdown
-        for i in {120..1}; do
-          echo "Tunnel active for $(($i * 30)) more seconds..."
-          sleep 30
-        done
+        # Keep alive for 2 hours
+        sleep 7200
 
-  # Optional: Auto-terminate EC2 instance after job completes
   cleanup:
-    if: always()  # Run even if previous steps fail
+    if: always()
     needs: create-aws-vps
     runs-on: ubuntu-latest
     steps:
@@ -241,10 +314,10 @@ jobs:
     - name: Terminate EC2 Instance
       run: |
         INSTANCE_ID="${{ needs.create-aws-vps.outputs.instance_id }}"
-        if [ ! -z "$INSTANCE_ID" ]; then
+        if [ ! -z "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ]; then
           echo "Terminating EC2 instance: $INSTANCE_ID"
           aws ec2 terminate-instances --instance-ids $INSTANCE_ID
-          echo "Instance termination initiated"
+          echo "✅ Instance termination initiated"
         else
           echo "No instance ID found to terminate"
         fi
