@@ -1,7 +1,7 @@
 name: Instant SSH Server via bore.pub
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  workflow_dispatch:
 
 jobs:
   create-ssh-server:
@@ -16,7 +16,9 @@ jobs:
           # Configure SSH for password authentication
           sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart sshd
+
+          # Restart SSH service (correct service name is 'ssh', not 'sshd')
+          sudo systemctl restart ssh
 
       - name: Create User 'runner' with Password '12345678'
         run: |
@@ -28,12 +30,12 @@ jobs:
           fi
           # Set password
           echo "runner:12345678" | sudo chpasswd
-          # Add to sudo group (optional, for convenience)
+          # Add to sudo group (optional)
           sudo usermod -aG sudo runner
 
       - name: Install bore-cli (fast tunnel)
         run: |
-          # Download precompiled bore binary from GitHub releases
+          # Download precompiled bore binary
           curl -L https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz | tar xz
           sudo mv bore /usr/local/bin/
 
