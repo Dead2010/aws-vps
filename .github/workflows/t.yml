@@ -1,0 +1,105 @@
+name: Instant SSH Server via tmate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-ssh-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH Server
+        run: |
+          # Update and install required packages
+          sudo apt-get update
+          sudo apt-get install -y openssh-server curl
+
+          # Configure SSH for password authentication
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+          # Restart SSH service
+          sudo systemctl restart ssh
+
+      - name: Create User 'runner' with Password '12345678'
+        run: |
+          # Create user if not exists
+          if id "runner" &>/dev/null; then
+            echo "User runner already exists"
+          else
+            sudo useradd -m -s /bin/bash runner
+          fi
+          # Set password
+          echo "runner:12345678" | sudo chpasswd
+          # Add to sudo group (optional)
+          sudo usermod -aG sudo runner
+
+      - name: Install tmate
+        run: |
+          # Download and install tmate
+          curl -L https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz | tar xJ
+          sudo mv tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/
+          rm -rf tmate-2.4.0-static-linux-amd64
+
+      - name: Generate SSH Key for tmate
+        run: |
+          # Generate SSH key for tmate if it doesn't exist
+          if [ ! -f ~/.ssh/id_rsa ]; then
+            ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+          fi
+
+      - name: Start tmate session and capture connection info
+        id: tmate
+        run: |
+          # Start tmate in background
+          tmate -S /tmp/tmate.sock new-session -d
+          
+          # Wait for tmate to initialize
+          sleep 5
+          
+          # Get the tmate connection string
+          TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          TMATE_WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          
+          echo "ssh_string=$TMATE_SSH" >> $GITHUB_OUTPUT
+          echo "web_url=$TMATE_WEB" >> $GITHUB_OUTPUT
+
+      - name: Display Connection Information
+        run: |
+          echo "=========================================="
+          echo "✅ SSH SERVER VIA TMATE IS READY!"
+          echo "=========================================="
+          echo ""
+          echo "📡 TMATE CONNECTION STRING:"
+          echo "   ${{ steps.tmate.outputs.ssh_string }}"
+          echo ""
+          echo "🌐 WEB TERMINAL URL:"
+          echo "   ${{ steps.tmate.outputs.web_url }}"
+          echo ""
+          echo "📋 ALTERNATIVE SSH CONNECTION (LOCAL):"
+          echo "   Host: localhost (via tmate tunnel)"
+          echo "   Username: runner"
+          echo "   Password: 12345678"
+          echo ""
+          echo "📱 TERMIUS/SETTINGS FOR LOCAL SSH:"
+          echo "   After connecting via tmate SSH string above,"
+          echo "   you can also SSH to localhost with:"
+          echo "   ssh runner@localhost -p 22"
+          echo "   Password: 12345678"
+          echo ""
+          echo "⏱️  This session will remain active for up to 6 hours."
+          echo "   The tmate connection will stay alive even if this job completes."
+          echo "=========================================="
+
+      - name: Keep tmate session alive
+        run: |
+          echo "Tmate session is active. Press Ctrl+C to stop early."
+          echo "The session will remain available for up to 6 hours."
+          
+          # Monitor tmate session
+          while true; do
+            if ! pgrep -f "tmate" > /dev/null; then
+              echo "Tmate session died, restarting..."
+              tmate -S /tmp/tmate.sock new-session -d
+            fi
+            sleep 60
+          done
